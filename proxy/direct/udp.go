@@ -2,116 +2,91 @@ package direct
 
 import (
 	"errors"
-	"log"
+	"fmt"
 	"net"
 	"sync"
 	"time"
 
-	tun2socks "github.com/eycorsican/go-tun2socks"
-	"github.com/eycorsican/go-tun2socks/lwip"
+	"github.com/eycorsican/go-tun2socks/common/log"
+	"github.com/eycorsican/go-tun2socks/core"
 )
 
 type udpHandler struct {
 	sync.Mutex
 
-	udpConns       map[tun2socks.Connection]*net.UDPConn
-	udpTargetAddrs map[tun2socks.Connection]*net.UDPAddr
+	timeout  time.Duration
+	udpConns map[core.UDPConn]*net.UDPConn
 }
 
-func NewUDPHandler() tun2socks.ConnectionHandler {
+func NewUDPHandler(timeout time.Duration) core.UDPConnHandler {
 	return &udpHandler{
-		udpConns:       make(map[tun2socks.Connection]*net.UDPConn, 8),
-		udpTargetAddrs: make(map[tun2socks.Connection]*net.UDPAddr, 8),
+		timeout:  timeout,
+		udpConns: make(map[core.UDPConn]*net.UDPConn, 8),
 	}
 }
 
-func (h *udpHandler) fetchUDPInput(conn tun2socks.Connection, pc *net.UDPConn) {
-	buf := lwip.NewBytes(lwip.BufSize)
+func (h *udpHandler) fetchUDPInput(conn core.UDPConn, pc *net.UDPConn) {
+	buf := core.NewBytes(core.BufSize)
 
 	defer func() {
 		h.Close(conn)
-		lwip.FreeBytes(buf)
+		core.FreeBytes(buf)
 	}()
 
 	for {
-		pc.SetDeadline(time.Now().Add(16 * time.Second))
-		n, _, err := pc.ReadFromUDP(buf)
+		pc.SetDeadline(time.Now().Add(h.timeout))
+		n, addr, err := pc.ReadFromUDP(buf)
 		if err != nil {
-			log.Printf("failed to read UDP data from remote: %v", err)
+			// log.Printf("failed to read UDP data from remote: %v", err)
 			return
 		}
 
-		err = conn.Write(buf[:n])
+		_, err = conn.WriteFrom(buf[:n], addr)
 		if err != nil {
-			log.Printf("failed to write UDP data to TUN")
+			log.Warnf("failed to write UDP data to TUN")
 			return
 		}
 	}
 }
 
-func (h *udpHandler) Connect(conn tun2socks.Connection, target net.Addr) error {
-	bindAddr := &net.UDPAddr{IP: net.IP{0, 0, 0, 0}, Port: 0}
+func (h *udpHandler) Connect(conn core.UDPConn, target net.Addr) error {
+	bindAddr := &net.UDPAddr{IP: nil, Port: 0}
 	pc, err := net.ListenUDP("udp", bindAddr)
 	if err != nil {
-		log.Printf("failed to bind udp address")
+		log.Errorf("failed to bind udp address")
 		return err
 	}
-	tgtAddr, _ := net.ResolveUDPAddr(target.Network(), target.String())
 	h.Lock()
-	h.udpTargetAddrs[conn] = tgtAddr
 	h.udpConns[conn] = pc
 	h.Unlock()
 	go h.fetchUDPInput(conn, pc)
+	log.Infof("new proxy connection for target: %s:%s", target.Network(), target.String())
 	return nil
 }
 
-func (h *udpHandler) DidReceive(conn tun2socks.Connection, data []byte) error {
+func (h *udpHandler) DidReceiveTo(conn core.UDPConn, data []byte, addr net.Addr) error {
 	h.Lock()
 	pc, ok1 := h.udpConns[conn]
-	addr, ok2 := h.udpTargetAddrs[conn]
 	h.Unlock()
 
-	if ok1 && ok2 {
+	if ok1 {
 		_, err := pc.WriteToUDP(data, addr)
 		if err != nil {
-			log.Printf("failed to write UDP payload to SOCKS5 server: %v", err)
+			log.Warnf("failed to write UDP payload to SOCKS5 server: %v", err)
 			return errors.New("failed to write UDP data")
 		}
 		return nil
 	} else {
-		return errors.New("udp connection does not exists")
+		return errors.New(fmt.Sprintf("proxy connection %v->%v does not exists", conn.LocalAddr(), conn.RemoteAddr()))
 	}
 }
 
-func (h *udpHandler) DidSend(conn tun2socks.Connection, len uint16) {
-	// unused
-}
-
-func (h *udpHandler) DidClose(conn tun2socks.Connection) {
-	// unused
-}
-
-func (h *udpHandler) DidAbort(conn tun2socks.Connection) {
-	// unused
-}
-
-func (h *udpHandler) DidReset(conn tun2socks.Connection) {
-	// unused
-}
-
-func (h *udpHandler) LocalDidClose(conn tun2socks.Connection) {
-	// unused
-}
-
-func (h *udpHandler) Close(conn tun2socks.Connection) {
+func (h *udpHandler) Close(conn core.UDPConn) {
 	conn.Close()
 
 	h.Lock()
 	defer h.Unlock()
 
-	if _, ok := h.udpTargetAddrs[conn]; ok {
-		delete(h.udpTargetAddrs, conn)
-	}
 	if pc, ok := h.udpConns[conn]; ok {
 		pc.Close()
 		delete(h.udpConns, conn)

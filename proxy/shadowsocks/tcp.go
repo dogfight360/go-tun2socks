@@ -4,166 +4,130 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"sync"
-	"time"
 
 	sscore "github.com/shadowsocks/go-shadowsocks2/core"
 	sssocks "github.com/shadowsocks/go-shadowsocks2/socks"
 
-	tun2socks "github.com/eycorsican/go-tun2socks"
-	"github.com/eycorsican/go-tun2socks/lwip"
+	"github.com/eycorsican/go-tun2socks/common/dns"
+	"github.com/eycorsican/go-tun2socks/common/log"
+	"github.com/eycorsican/go-tun2socks/core"
 )
 
 type tcpHandler struct {
 	sync.Mutex
 
-	cipher   sscore.Cipher
-	server   string
-	conns    map[tun2socks.Connection]net.Conn
-	tgtAddrs map[tun2socks.Connection]net.Addr
-	tgtSent  map[tun2socks.Connection]bool
+	cipher sscore.Cipher
+	server string
+	conns  map[core.TCPConn]net.Conn
+
+	fakeDns dns.FakeDns
 }
 
-func (h *tcpHandler) getConn(conn tun2socks.Connection) (net.Conn, bool) {
-	h.Lock()
-	defer h.Unlock()
-	if c, ok := h.conns[conn]; ok {
-		return c, true
-	}
-	return nil, false
-}
-
-func (h *tcpHandler) fetchInput(conn tun2socks.Connection, input io.Reader) {
-	buf := lwip.NewBytes(lwip.BufSize)
-
+func (h *tcpHandler) fetchInput(conn core.TCPConn, input io.Reader) {
 	defer func() {
 		h.Close(conn)
-		lwip.FreeBytes(buf)
+		conn.Close() // also close tun2socks connection here
 	}()
 
-	for {
-		n, err := input.Read(buf)
-		if err != nil {
-			if err != io.EOF {
-				log.Printf("failed to read from Shadowsocks server: %v", err)
-				h.Close(conn)
-				return
-			}
-			break
-		}
-		err = conn.Write(buf[:n])
-		if err != nil {
-			log.Printf("failed to send data to TUN: %v", err)
-			h.Close(conn)
-			return
-		}
+	_, err := io.Copy(conn, input)
+	if err != nil {
+		// log.Printf("fetch input failed: %v", err)
+		return
 	}
 }
 
-func NewTCPHandler(server, cipher, password string) tun2socks.ConnectionHandler {
+func NewTCPHandler(server, cipher, password string, fakeDns dns.FakeDns) core.TCPConnHandler {
 	ciph, err := sscore.PickCipher(cipher, []byte{}, password)
 	if err != nil {
-		log.Fatal(err)
+		log.Errorf("failed to pick a cipher: %v", err)
 	}
 
 	return &tcpHandler{
-		cipher:   ciph,
-		server:   server,
-		conns:    make(map[tun2socks.Connection]net.Conn, 16),
-		tgtAddrs: make(map[tun2socks.Connection]net.Addr, 16),
-		tgtSent:  make(map[tun2socks.Connection]bool, 16),
+		cipher:  ciph,
+		server:  server,
+		conns:   make(map[core.TCPConn]net.Conn, 16),
+		fakeDns: fakeDns,
 	}
 }
 
-func (h *tcpHandler) sendTargetAddress(conn tun2socks.Connection) error {
-	h.Lock()
-	tgtAddr, ok1 := h.tgtAddrs[conn]
-	rc, ok2 := h.conns[conn]
-	h.Unlock()
-	if ok1 && ok2 {
-		tgt := sssocks.ParseAddr(tgtAddr.String())
-		_, err := rc.Write(tgt)
-		if err != nil {
-			return errors.New(fmt.Sprintf("sending target address failed: %v", err))
-		}
-		h.tgtSent[conn] = true
-		go h.fetchInput(conn, rc)
-	} else {
-		return errors.New("target address not found")
+func (h *tcpHandler) Connect(conn core.TCPConn, target net.Addr) error {
+	if target == nil {
+		log.Fatalf("unexpected nil target")
 	}
-	return nil
-}
 
-func (h *tcpHandler) Connect(conn tun2socks.Connection, target net.Addr) error {
+	// Connect the relay server.
 	rc, err := net.Dial("tcp", h.server)
 	if err != nil {
-		return errors.New(fmt.Sprintf("dialing remote server failed: %v", err))
+		return errors.New(fmt.Sprintf("dial remote server failed: %v", err))
 	}
 	rc = h.cipher.StreamConn(rc)
 
+	// Replace with a domain name if target address IP is a fake IP.
+	host, port, err := net.SplitHostPort(target.String())
+	if err != nil {
+		log.Errorf("error when split host port %v", err)
+	}
+	var targetHost string = host
+	if h.fakeDns != nil {
+		if ip := net.ParseIP(host); ip != nil {
+			if h.fakeDns.IsFakeIP(ip) {
+				targetHost = h.fakeDns.QueryDomain(ip)
+			}
+		}
+	}
+	dest := fmt.Sprintf("%s:%s", targetHost, port)
+
+	// Write target address.
+	tgt := sssocks.ParseAddr(dest)
+	_, err = rc.Write(tgt)
+	if err != nil {
+		return fmt.Errorf("send target address failed: %v", err)
+	}
+
 	h.Lock()
 	h.conns[conn] = rc
-	h.tgtAddrs[conn] = target
 	h.Unlock()
-	rc.SetDeadline(time.Time{})
+
+	go h.fetchInput(conn, rc)
+
+	log.Infof("new proxy connection for target: %s:%s", target.Network(), dest)
 	return nil
 }
 
-func (h *tcpHandler) DidReceive(conn tun2socks.Connection, data []byte) error {
+func (h *tcpHandler) DidReceive(conn core.TCPConn, data []byte) error {
 	h.Lock()
 	rc, ok1 := h.conns[conn]
-	sent, ok2 := h.tgtSent[conn]
 	h.Unlock()
 
 	if ok1 {
-		if !ok2 || !sent {
-			h.sendTargetAddress(conn)
-		}
-
 		_, err := rc.Write(data)
 		if err != nil {
-			log.Printf("failed to write data to Shadowsocks server: %v", err)
 			h.Close(conn)
-			return errors.New(fmt.Sprintf("failed to write data: %v", err))
+			return errors.New(fmt.Sprintf("write remote failed: %v", err))
 		}
 		return nil
 	} else {
-		return errors.New(fmt.Sprintf("proxy connection does not exists: %v <-> %v", conn.LocalAddr().String(), conn.RemoteAddr().String()))
+		h.Close(conn)
+		return errors.New(fmt.Sprintf("proxy connection %v->%v does not exists", conn.LocalAddr(), conn.RemoteAddr()))
 	}
 }
 
-func (h *tcpHandler) DidSend(conn tun2socks.Connection, len uint16) {
-}
-
-func (h *tcpHandler) DidClose(conn tun2socks.Connection) {
+func (h *tcpHandler) DidClose(conn core.TCPConn) {
 	h.Close(conn)
 }
 
-func (h *tcpHandler) DidAbort(conn tun2socks.Connection) {
+func (h *tcpHandler) LocalDidClose(conn core.TCPConn) {
 	h.Close(conn)
 }
 
-func (h *tcpHandler) DidReset(conn tun2socks.Connection) {
-	h.Close(conn)
-}
-
-func (h *tcpHandler) LocalDidClose(conn tun2socks.Connection) {
-	h.Close(conn)
-}
-
-func (h *tcpHandler) Close(conn tun2socks.Connection) {
-	if rc, found := h.getConn(conn); found {
-		rc.Close()
-		h.Lock()
-		delete(h.conns, conn)
-		h.Unlock()
-	}
-
+func (h *tcpHandler) Close(conn core.TCPConn) {
 	h.Lock()
 	defer h.Unlock()
 
-	delete(h.tgtAddrs, conn)
-	delete(h.tgtSent, conn)
+	if rc, found := h.conns[conn]; found {
+		rc.Close()
+	}
+	delete(h.conns, conn)
 }

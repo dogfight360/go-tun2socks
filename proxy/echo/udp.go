@@ -1,46 +1,31 @@
 package echo
 
 import (
-	"log"
 	"net"
 
-	tun2socks "github.com/eycorsican/go-tun2socks"
+	"github.com/eycorsican/go-tun2socks/common/log"
+	"github.com/eycorsican/go-tun2socks/core"
 )
 
 // An echo server, do nothing but echo back data to the sender.
 type udpHandler struct{}
 
-func NewUDPHandler() tun2socks.ConnectionHandler {
+func NewUDPHandler() core.UDPConnHandler {
 	return &udpHandler{}
 }
 
-func (h *udpHandler) Connect(conn tun2socks.Connection, target net.Addr) error {
+func (h *udpHandler) Connect(conn core.UDPConn, target net.Addr) error {
 	return nil
 }
 
-func (h *udpHandler) DidReceive(conn tun2socks.Connection, data []byte) error {
+func (h *udpHandler) DidReceiveTo(conn core.UDPConn, data []byte, addr net.Addr) error {
 	// Dispatch to another goroutine, otherwise will result in deadlock.
 	payload := append([]byte(nil), data...)
 	go func(b []byte) {
-		err := conn.Write(b)
+		_, err := conn.WriteFrom(b, addr)
 		if err != nil {
-			log.Printf("failed to echo back data: %v", err)
+			log.Warnf("failed to echo back data: %v", err)
 		}
 	}(payload)
 	return nil
-}
-
-func (h *udpHandler) DidSend(conn tun2socks.Connection, len uint16) {
-}
-
-func (h *udpHandler) DidClose(conn tun2socks.Connection) {
-}
-
-func (h *udpHandler) DidAbort(conn tun2socks.Connection) {
-}
-
-func (h *udpHandler) DidReset(conn tun2socks.Connection) {
-}
-
-func (h *udpHandler) LocalDidClose(conn tun2socks.Connection) {
 }

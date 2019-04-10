@@ -4,15 +4,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"sync"
 	"time"
 
 	"golang.org/x/net/proxy"
 
-	tun2socks "github.com/eycorsican/go-tun2socks"
-	"github.com/eycorsican/go-tun2socks/lwip"
+	"github.com/eycorsican/go-tun2socks/common/dns"
+	"github.com/eycorsican/go-tun2socks/common/log"
+	"github.com/eycorsican/go-tun2socks/core"
 )
 
 type tcpHandler struct {
@@ -20,46 +20,38 @@ type tcpHandler struct {
 
 	proxyHost string
 	proxyPort uint16
-	conns     map[tun2socks.Connection]net.Conn
+	conns     map[core.TCPConn]net.Conn
+
+	fakeDns dns.FakeDns
 }
 
-func NewTCPHandler(proxyHost string, proxyPort uint16) tun2socks.ConnectionHandler {
+func NewTCPHandler(proxyHost string, proxyPort uint16, fakeDns dns.FakeDns) core.TCPConnHandler {
 	return &tcpHandler{
 		proxyHost: proxyHost,
 		proxyPort: proxyPort,
-		conns:     make(map[tun2socks.Connection]net.Conn, 16),
+		conns:     make(map[core.TCPConn]net.Conn, 16),
+		fakeDns:   fakeDns,
 	}
 }
 
-func (h *tcpHandler) fetchInput(conn tun2socks.Connection, input io.Reader) {
-	buf := lwip.NewBytes(lwip.BufSize)
+func (h *tcpHandler) fetchInput(conn core.TCPConn, input io.Reader) {
+	// FIXME maybe use a larger buffer?
+	buf := core.NewBytes(core.BufSize) // 2k buf
 
 	defer func() {
 		h.Close(conn)
-		lwip.FreeBytes(buf)
+		conn.Close() // also close tun2socks connection here
+		core.FreeBytes(buf)
 	}()
 
-	for {
-		n, err := input.Read(buf)
-		if err != nil {
-			if err != io.EOF {
-				log.Printf("failed to read from SOCKS5 server: %v", err)
-				h.Close(conn)
-				return
-			}
-			break
-		}
-		// No copy, since we are using TCP_WRITE_FLAG_COPY in tcp_write()
-		err = conn.Write(buf[:n])
-		if err != nil {
-			log.Printf("failed to send data to TUN: %v", err)
-			h.Close(conn)
-			return
-		}
+	_, err := io.CopyBuffer(conn, input, buf)
+	if err != nil {
+		// log.Printf("fetch input failed: %v", err)
+		return
 	}
 }
 
-func (h *tcpHandler) getConn(conn tun2socks.Connection) (net.Conn, bool) {
+func (h *tcpHandler) getConn(conn core.TCPConn) (net.Conn, bool) {
 	h.Lock()
 	defer h.Unlock()
 	if c, ok := h.conns[conn]; ok {
@@ -68,15 +60,29 @@ func (h *tcpHandler) getConn(conn tun2socks.Connection) (net.Conn, bool) {
 	return nil, false
 }
 
-func (h *tcpHandler) Connect(conn tun2socks.Connection, target net.Addr) error {
-	dialer, err := proxy.SOCKS5("tcp", fmt.Sprintf("%s:%d", h.proxyHost, h.proxyPort), nil, nil)
+func (h *tcpHandler) Connect(conn core.TCPConn, target net.Addr) error {
+	dialer, err := proxy.SOCKS5("tcp", core.ParseTCPAddr(h.proxyHost, h.proxyPort).String(), nil, nil)
 	if err != nil {
-		log.Printf("failed to create SOCKS5 dialer: %v", err)
 		return err
 	}
-	c, err := dialer.Dial(target.Network(), target.String())
+
+	// Replace with a domain name if target address IP is a fake IP.
+	host, port, err := net.SplitHostPort(target.String())
 	if err != nil {
-		log.Printf("failed to dial SOCKS5 server: %v", err)
+		log.Errorf("error when split host port %v", err)
+	}
+	var targetHost string = host
+	if h.fakeDns != nil {
+		if ip := net.ParseIP(host); ip != nil {
+			if h.fakeDns.IsFakeIP(ip) {
+				targetHost = h.fakeDns.QueryDomain(ip)
+			}
+		}
+	}
+	dest := fmt.Sprintf("%s:%s", targetHost, port)
+
+	c, err := dialer.Dial(target.Network(), dest)
+	if err != nil {
 		return err
 	}
 	h.Lock()
@@ -84,43 +90,35 @@ func (h *tcpHandler) Connect(conn tun2socks.Connection, target net.Addr) error {
 	h.Unlock()
 	c.SetDeadline(time.Time{})
 	go h.fetchInput(conn, c)
+	log.Infof("new proxy connection for target: %s:%s", target.Network(), fmt.Sprintf("%s:%s", targetHost, port))
 	return nil
 }
 
-func (h *tcpHandler) DidReceive(conn tun2socks.Connection, data []byte) error {
+func (h *tcpHandler) DidReceive(conn core.TCPConn, data []byte) error {
 	if c, found := h.getConn(conn); found {
 		_, err := c.Write(data)
 		if err != nil {
-			log.Printf("failed to write data to SOCKS5 server: %v", err)
 			h.Close(conn)
-			return errors.New("failed to write data")
+			return errors.New(fmt.Sprintf("write remote failed: %v", err))
 		}
 		return nil
 	} else {
-		return errors.New(fmt.Sprintf("proxy connection does not exists: %v <-> %v", conn.LocalAddr().String(), conn.RemoteAddr().String()))
+		return errors.New(fmt.Sprintf("proxy connection %v->%v does not exists", conn.LocalAddr(), conn.RemoteAddr()))
 	}
 }
 
-func (h *tcpHandler) DidSend(conn tun2socks.Connection, len uint16) {
+func (h *tcpHandler) DidSend(conn core.TCPConn, len uint16) {
 }
 
-func (h *tcpHandler) DidClose(conn tun2socks.Connection) {
+func (h *tcpHandler) DidClose(conn core.TCPConn) {
 	h.Close(conn)
 }
 
-func (h *tcpHandler) DidAbort(conn tun2socks.Connection) {
+func (h *tcpHandler) LocalDidClose(conn core.TCPConn) {
 	h.Close(conn)
 }
 
-func (h *tcpHandler) DidReset(conn tun2socks.Connection) {
-	h.Close(conn)
-}
-
-func (h *tcpHandler) LocalDidClose(conn tun2socks.Connection) {
-	h.Close(conn)
-}
-
-func (h *tcpHandler) Close(conn tun2socks.Connection) {
+func (h *tcpHandler) Close(conn core.TCPConn) {
 	if c, found := h.getConn(conn); found {
 		c.Close()
 		h.Lock()
