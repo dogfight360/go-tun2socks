@@ -6,15 +6,15 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
 
-	"github.com/eycorsican/go-tun2socks/common/dns"
+	"github.com/eycorsican/go-tun2socks/common/dns/blocker"
 	"github.com/eycorsican/go-tun2socks/common/log"
 	_ "github.com/eycorsican/go-tun2socks/common/log/simple" // Register a simple logger.
 	"github.com/eycorsican/go-tun2socks/core"
-	"github.com/eycorsican/go-tun2socks/filter"
 	"github.com/eycorsican/go-tun2socks/tun"
 )
 
@@ -39,22 +39,15 @@ type CmdArgs struct {
 	TunGw           *string
 	TunMask         *string
 	TunDns          *string
+	TunPersist      *bool
+	BlockOutsideDns *bool
 	ProxyType       *string
-	VConfig         *string
-	Gateway         *string
-	SniffingType    *string
 	ProxyServer     *string
 	ProxyHost       *string
 	ProxyPort       *uint16
-	ProxyCipher     *string
-	ProxyPassword   *string
-	DelayICMP       *int
 	UdpTimeout      *time.Duration
-	Applog          *bool
-	DisableDnsCache *bool
-	DnsFallback     *bool
 	LogLevel        *string
-	EnableFakeDns   *bool
+	DnsFallback     *bool
 }
 
 type cmdFlag uint
@@ -62,23 +55,17 @@ type cmdFlag uint
 const (
 	fProxyServer cmdFlag = iota
 	fUdpTimeout
-	fApplog
 )
 
 var flagCreaters = map[cmdFlag]func(){
 	fProxyServer: func() {
 		if args.ProxyServer == nil {
-			args.ProxyServer = flag.String("proxyServer", "1.2.3.4:1087", "Proxy server address (host:port) for socks and Shadowsocks proxies")
+			args.ProxyServer = flag.String("proxyServer", "1.2.3.4:1087", "Proxy server address")
 		}
 	},
 	fUdpTimeout: func() {
 		if args.UdpTimeout == nil {
-			args.UdpTimeout = flag.Duration("udpTimeout", 1*time.Minute, "Set timeout for UDP proxy connections in SOCKS and Shadowsocks")
-		}
-	},
-	fApplog: func() {
-		if args.Applog == nil {
-			args.Applog = flag.Bool("applog", false, "Enable app logging (V2Ray, Shadowsocks and SOCKS5 handler)")
+			args.UdpTimeout = flag.Duration("udpTimeout", 1*time.Minute, "UDP session timeout")
 		}
 	},
 }
@@ -95,10 +82,6 @@ var args = new(CmdArgs)
 
 var lwipWriter io.Writer
 
-var dnsCache dns.DnsCache
-
-var fakeDns dns.FakeDns
-
 const (
 	MTU = 1500
 )
@@ -106,12 +89,13 @@ const (
 func main() {
 	args.Version = flag.Bool("version", false, "Print version")
 	args.TunName = flag.String("tunName", "tun1", "TUN interface name")
-	args.TunAddr = flag.String("tunAddr", "240.0.0.2", "TUN interface address")
-	args.TunGw = flag.String("tunGw", "240.0.0.1", "TUN interface gateway")
-	args.TunMask = flag.String("tunMask", "255.255.255.0", "TUN interface netmask, as for IPv6, it's the prefixlen")
-	args.TunDns = flag.String("tunDns", "114.114.114.114,223.5.5.5", "DNS resolvers for TUN interface (only need on Windows)")
-	args.ProxyType = flag.String("proxyType", "socks", "Proxy handler type, e.g. socks, shadowsocks, v2ray")
-	args.DelayICMP = flag.Int("delayICMP", 10, "Delay ICMP packets for a short period of time, in milliseconds")
+	args.TunAddr = flag.String("tunAddr", "10.255.0.2", "TUN interface address")
+	args.TunGw = flag.String("tunGw", "10.255.0.1", "TUN interface gateway")
+	args.TunMask = flag.String("tunMask", "255.255.255.0", "TUN interface netmask, it should be a prefixlen (a number) for IPv6 address")
+	args.TunDns = flag.String("tunDns", "8.8.8.8,8.8.4.4", "DNS resolvers for TUN interface (only need on Windows)")
+	args.TunPersist = flag.Bool("tunPersist", false, "Persist TUN interface after the program exits or the last open file descriptor is closed (Linux only)")
+	args.BlockOutsideDns = flag.Bool("blockOutsideDns", false, "Prevent DNS leaks by blocking plaintext DNS queries going out through non-TUN interface (may require admin privileges) (Windows only) ")
+	args.ProxyType = flag.String("proxyType", "socks", "Proxy handler type")
 	args.LogLevel = flag.String("loglevel", "info", "Logging level. (debug, info, warn, error, none)")
 
 	flag.Parse()
@@ -146,25 +130,19 @@ func main() {
 
 	// Open the tun device.
 	dnsServers := strings.Split(*args.TunDns, ",")
-	tunDev, err := tun.OpenTunDevice(*args.TunName, *args.TunAddr, *args.TunGw, *args.TunMask, dnsServers)
+	tunDev, err := tun.OpenTunDevice(*args.TunName, *args.TunAddr, *args.TunGw, *args.TunMask, dnsServers, *args.TunPersist)
 	if err != nil {
 		log.Fatalf("failed to open tun device: %v", err)
 	}
 
+	if runtime.GOOS == "windows" && *args.BlockOutsideDns {
+		if err := blocker.BlockOutsideDns(*args.TunName); err != nil {
+			log.Fatalf("failed to block outside DNS: %v", err)
+		}
+	}
+
 	// Setup TCP/IP stack.
 	lwipWriter := core.NewLWIPStack().(io.Writer)
-
-	// Wrap a writer to delay ICMP packets if delay time is not zero.
-	if *args.DelayICMP > 0 {
-		log.Infof("ICMP packets will be delayed for %dms", *args.DelayICMP)
-		lwipWriter = filter.NewICMPFilter(lwipWriter, *args.DelayICMP).(io.Writer)
-	}
-
-	// Wrap a writer to print out processes the creating network connections.
-	if args.Applog != nil && *args.Applog {
-		log.Infof("App logging is enabled")
-		lwipWriter = filter.NewApplogFilter(lwipWriter).(io.Writer)
-	}
 
 	// Register TCP and UDP handlers to handle accepted connections.
 	if creater, found := handlerCreater[*args.ProxyType]; found {

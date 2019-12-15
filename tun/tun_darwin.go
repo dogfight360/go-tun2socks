@@ -30,14 +30,14 @@ func isIPv6(ip net.IP) bool {
 	return false
 }
 
-func OpenTunDevice(name, addr, gw, mask string, dnsServers []string) (io.ReadWriteCloser, error) {
+func OpenTunDevice(name, addr, gw, mask string, dnsServers []string, persist bool) (io.ReadWriteCloser, error) {
 	tunDev, err := water.New(water.Config{
 		DeviceType: water.TUN,
 	})
-	name = tunDev.Name()
 	if err != nil {
 		return nil, err
 	}
+	name = tunDev.Name()
 	ip := net.ParseIP(addr)
 	if ip == nil {
 		return nil, errors.New("invalid IP address")

@@ -8,8 +8,8 @@ package core
 import "C"
 import (
 	"errors"
-	"fmt"
 	"net"
+	"strconv"
 	"unsafe"
 )
 
@@ -29,46 +29,18 @@ func ipAddrATON(cp string, addr *C.struct_ip_addr) error {
 	}
 }
 
-func ParseTCPAddr(addr string, port uint16) net.Addr {
-	ip := net.ParseIP(addr).To4()
-	if ip != nil {
-		// Seems an IPv4 address.
-		netAddr, err := net.ResolveTCPAddr("tcp", fmt.Sprintf("%s:%d", addr, port))
-		if err != nil {
-			return nil
-		}
-		return netAddr
+func ParseTCPAddr(addr string, port uint16) *net.TCPAddr {
+	netAddr, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(addr, strconv.Itoa(int(port))))
+	if err != nil {
+		return nil
 	}
-	ip = net.ParseIP(addr).To16()
-	if ip != nil {
-		// Seems an IPv6 address.
-		netAddr, err := net.ResolveTCPAddr("tcp", fmt.Sprintf("[%s]:%d", addr, port))
-		if err != nil {
-			return nil
-		}
-		return netAddr
-	}
-	return nil
+	return netAddr
 }
 
-func ParseUDPAddr(addr string, port uint16) net.Addr {
-	ip := net.ParseIP(addr).To4()
-	if ip != nil {
-		// Seems an IPv4 address.
-		netAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", addr, port))
-		if err != nil {
-			return nil
-		}
-		return netAddr
+func ParseUDPAddr(addr string, port uint16) *net.UDPAddr {
+	netAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(addr, strconv.Itoa(int(port))))
+	if err != nil {
+		return nil
 	}
-	ip = net.ParseIP(addr).To16()
-	if ip != nil {
-		// Seems an IPv6 address.
-		netAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("[%s]:%d", addr, port))
-		if err != nil {
-			return nil
-		}
-		return netAddr
-	}
-	return nil
+	return netAddr
 }
